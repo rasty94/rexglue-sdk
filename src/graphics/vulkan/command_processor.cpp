@@ -55,6 +55,17 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// When the previous readback slot for a memexport (address, size) key is still
+// in flight (written in the open submission, or the GPU is behind), the fast
+// path falls back to a full GPU drain. Opt in to skip the read instead; skipped
+// reads can leave the guest with stale or missing memexport data.
+REXCVAR_DEFINE_BOOL(readback_memexport_no_drain, false, "GPU",
+                    "With readback_memexport_fast, when the previous memexport copy for the same "
+                    "destination has not completed on the GPU yet, skip the CPU readback for this "
+                    "draw instead of draining the GPU. The guest then sees the data of a previous "
+                    "memexport draw once its copy completes, instead of the current draw's data.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
@@ -4370,7 +4381,13 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   bool previous_slot_ready =
       previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
-    IssueDraw_MemexportReadbackFullPath(total_size);
+    // With no_drain the read is skipped, not deferred: the slot just written
+    // keeps its submission_written, so the next draw with this key copies it
+    // once that submission completes. Delivering every draw's data without a
+    // drain would need the copy done at fence reclaim (per-submission buffer).
+    if (!REXCVAR_GET(readback_memexport_no_drain)) {
+      IssueDraw_MemexportReadbackFullPath(total_size);
+    }
     readback.current_index = read_index;
     return true;
   }
