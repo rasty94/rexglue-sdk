@@ -27,7 +27,16 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(vulkan_shared_memory_upload_first, false, "GPU/Vulkan",
+// On tile-based GPUs (Apple) every render pass interruption stores and reloads
+// the attachments, so uploads that break the pass dominate the frame; on
+// immediate-mode GPUs the interruption is cheap, keep the proven path there.
+#if REX_PLATFORM_MAC
+constexpr bool kSharedMemoryUploadFirstDefault = true;
+#else
+constexpr bool kSharedMemoryUploadFirstDefault = false;
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_upload_first, kSharedMemoryUploadFirstDefault,
+                    "GPU/Vulkan",
                     "Upload shared memory pages not yet accessed by the GPU in the current "
                     "submission at its beginning instead of interrupting the render pass");
 
