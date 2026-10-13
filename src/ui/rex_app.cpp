@@ -48,6 +48,9 @@
 #include <filesystem>
 #include <string_view>
 
+REXCVAR_DEFINE_BOOL(show_debug_overlay, false, "UI",
+                    "Open the debug overlay (guest FPS, F3) at startup");
+
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
@@ -429,6 +432,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
   });
+  if (REXCVAR_GET(show_debug_overlay)) {
+    debug_overlay_ =
+        std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+  }
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
       console_overlay_.reset();
