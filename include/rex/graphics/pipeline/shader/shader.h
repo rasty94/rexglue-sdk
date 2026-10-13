@@ -661,6 +661,11 @@ class Shader {
     // strip orientation, for implementations without unconditional geometry
     // shader support.
     kRectangleListAsTriangleStrip,
+
+    // Continuous quad patch with a constant even integer tessellation factor
+    // drawn as an instanced triangle list grid (one instance per patch), for
+    // implementations where hardware tessellation is slow (MoltenVK).
+    kQuadDomainPatchIndexedAsTriangleList,
   };
   // For packing HostVertexShaderType in bit fields.
   static constexpr uint32_t kHostVertexShaderTypeBitCount = 4;

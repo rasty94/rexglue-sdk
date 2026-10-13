@@ -134,6 +134,9 @@ class PrimitiveProcessor {
     // index buffer size, using zeros for out-of-bounds indices.
     uint32_t guest_draw_vertex_count;
     uint32_t host_draw_vertex_count;
+    // Instance count for the host draw, 1 except for
+    // kQuadDomainPatchIndexedAsTriangleList (one instance per patch).
+    uint32_t host_draw_instance_count = 1;
     uint32_t line_loop_closing_index;
     ProcessedIndexBufferType index_buffer_type;
     uint32_t guest_index_base;
@@ -237,10 +240,16 @@ class PrimitiveProcessor {
   //     emulation. Overrides do not apply to these as hosts are not required to
   //     support the fallback paths since they require different vertex shader
   //     structure (for the fallback HostVertexShaderTypes).
+  // - emulate_continuous_quad_patch_tessellation:
+  //   - Pass true to draw continuous-tessellated quad patches with a constant
+  //     even integer factor as instanced triangle lists
+  //     (kQuadDomainPatchIndexedAsTriangleList) instead of using the host
+  //     tessellation, requires 16-bit indexed draws with instancing.
   bool InitializeCommon(bool full_32bit_vertex_indices_supported, bool triangle_fans_supported,
                         bool line_loops_supported, bool quad_lists_supported,
                         bool point_sprites_supported_without_vs_expansion,
-                        bool rectangle_lists_supported_without_vs_expansion);
+                        bool rectangle_lists_supported_without_vs_expansion,
+                        bool emulate_continuous_quad_patch_tessellation);
   // If any primitive type conversion is needed for auto-indexed draws, called
   // from InitializeCommon (thus only once in the primitive processor's
   // lifetime) to set up the backend's index buffer containing indices for
@@ -633,11 +642,15 @@ class PrimitiveProcessor {
   bool convert_quad_lists_to_triangle_lists_ = false;
   bool expand_point_sprites_in_vs_ = false;
   bool expand_rectangle_lists_in_vs_ = false;
+  bool emulate_continuous_quad_patch_tessellation_ = false;
 
   // Byte offsets used, for simplicity, directly as handles.
   size_t builtin_ib_offset_two_triangle_strips_ = SIZE_MAX;
   size_t builtin_ib_offset_triangle_fans_to_lists_ = SIZE_MAX;
   size_t builtin_ib_offset_quad_lists_to_triangle_lists_ = SIZE_MAX;
+  // Grids of (N + 1) x (N + 1) vertices as 16-bit triangle lists for the
+  // factor N (even, 2 to 64) at the index N / 2, SIZE_MAX if not used.
+  size_t builtin_ib_offset_tess_grid_[33] = {};
 
   std::deque<SinglePrimitiveRange> single_primitive_ranges_;
 

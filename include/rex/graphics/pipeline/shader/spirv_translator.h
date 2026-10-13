@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -70,6 +70,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // For HostVertexShaderType kQuadDomainPatchIndexedAsTriangleList only,
+      // the (even) tessellation factor N of the (N + 1) x (N + 1) vertex grid.
+      uint32_t emulated_tessellation_factor : 7;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -897,6 +900,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // VS as VS only - int, or VS as compute (kMemExportCompute) only - uint3.
   spv::Id input_vertex_index_;
+  // VS as VS only, for kQuadDomainPatchIndexedAsTriangleList - int.
+  spv::Id input_instance_index_;
   // VS as TES only - int.
   spv::Id input_primitive_id_;
   // VS as TES only - float3.

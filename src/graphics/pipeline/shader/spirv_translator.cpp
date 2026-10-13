@@ -113,6 +113,7 @@ void SpirvShaderTranslator::Reset() {
   uniform_float_constants_ = spv::NoResult;
 
   input_vertex_index_ = spv::NoResult;
+  input_instance_index_ = spv::NoResult;
   input_primitive_id_ = spv::NoResult;
   input_tess_coord_ = spv::NoResult;
   input_patch_control_point_indices_ = spv::NoResult;
@@ -1668,6 +1669,15 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
                                                    type_int_, "gl_VertexIndex");
     builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
     main_interface_.push_back(input_vertex_index_);
+    if (GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+        Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList) {
+      // One instance per patch.
+      input_instance_index_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                                       type_int_, "gl_InstanceIndex");
+      builder_->addDecoration(input_instance_index_, spv::DecorationBuiltIn,
+                              spv::BuiltInInstanceIndex);
+      main_interface_.push_back(input_instance_index_);
+    }
   }
 
   uint32_t output_location = 0;
@@ -1928,6 +1938,9 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
       spv::Id compute_vertex_processing_index = spv::NoResult;
       spv::Id compute_load_vertex_index = spv::NoResult;
       spv::Id compute_vertex_index_is_32bit = spv::NoResult;
+      // For kQuadDomainPatchIndexedAsTriangleList, the domain location.
+      spv::Id emulated_tessellation_u = spv::NoResult;
+      spv::Id emulated_tessellation_v = spv::NoResult;
       if (IsSpirvComputeShader()) {
         spv::Id global_invocation_id = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
         spv::Id global_invocation_x =
@@ -1985,12 +1998,44 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
       if (IsSpirvVertexShader() &&
           (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
            host_vertex_shader_type ==
-               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip)) {
+               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip ||
+           host_vertex_shader_type ==
+               Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList)) {
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
         spv::Id two_triangle_strip_vertex_index = vertex_index;
-        // Extract the primitive index from the two-triangle strip vertex index.
-        vertex_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                                             two_triangle_strip_vertex_index, const_uint_2);
+        if (host_vertex_shader_type ==
+            Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList) {
+          // The vertex index is the vertex of the (N + 1) x (N + 1) grid of the
+          // patch (from the builtin index buffer), the instance index is the
+          // patch ordinal (the index of the guest vertex in the guest
+          // primitive, to be converted to the guest index below).
+          uint32_t tessellation_factor = shader_modification.vertex.emulated_tessellation_factor;
+          spv::Id grid_vertex_index =
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                      builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+          spv::Id grid_size = builder_->makeUintConstant(tessellation_factor + 1);
+          spv::Id tessellation_factor_float =
+              builder_->makeFloatConstant(float(tessellation_factor));
+          emulated_tessellation_u = builder_->createBinOp(
+              spv::OpFDiv, type_float_,
+              builder_->createUnaryOp(
+                  spv::OpConvertUToF, type_float_,
+                  builder_->createBinOp(spv::OpUMod, type_uint_, grid_vertex_index, grid_size)),
+              tessellation_factor_float);
+          emulated_tessellation_v = builder_->createBinOp(
+              spv::OpFDiv, type_float_,
+              builder_->createUnaryOp(
+                  spv::OpConvertUToF, type_float_,
+                  builder_->createBinOp(spv::OpUDiv, type_uint_, grid_vertex_index, grid_size)),
+              tessellation_factor_float);
+          vertex_index = builder_->createUnaryOp(
+              spv::OpBitcast, type_uint_,
+              builder_->createLoad(input_instance_index_, spv::NoPrecision));
+        } else {
+          // Extract the primitive index from the two-triangle strip vertex index.
+          vertex_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                               two_triangle_strip_vertex_index, const_uint_2);
+        }
         if (host_vertex_shader_type ==
             Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
           spv::Id const_uint_3 = builder_->makeUintConstant(3);
@@ -2431,6 +2476,15 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
         if_cp_indexed.makeEndIf();
       } else {
         store_register_component(0, 0, vertex_index_float);
+        if (emulated_tessellation_u != spv::NoResult) {
+          // Same as for kQuadDomainPatchIndexed: r0.yz = domain location xy,
+          // r1.x = swizzle.
+          store_register_component(0, 1, emulated_tessellation_u);
+          store_register_component(0, 2, emulated_tessellation_v);
+          if (register_count() >= 2) {
+            store_register_component(1, 0, const_float_0_);
+          }
+        }
       }
     }
   }

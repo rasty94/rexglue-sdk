@@ -3744,6 +3744,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
+        host_vertex_shader_type !=
+            Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList &&
         !Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
       REXGPU_ERROR("Unsupported Vulkan host vertex shader type {}",
                    uint32_t(host_vertex_shader_type));
@@ -4132,7 +4134,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count,
+                                       primitive_processing_result.host_draw_instance_count, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
@@ -4163,7 +4166,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count,
+                                              primitive_processing_result.host_draw_instance_count,
                                               0, 0, 0);
   }
 

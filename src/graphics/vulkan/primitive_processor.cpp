@@ -14,11 +14,13 @@
 #include <memory>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_force_expand_point_sprites_in_vs, false, "GPU/Vulkan",
@@ -34,6 +36,22 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
                     "Force Vulkan quad list conversion to triangle lists in primitive processing, "
                     "even when geometry shaders are available")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// MoltenVK emulates tessellation with a compute pass and a Metal render pass
+// restart per tessellated draw, which is very slow; draw the common case
+// (continuous quad patches with a constant even factor) as instanced triangle
+// grids instead.
+#if REX_PLATFORM_MAC
+constexpr bool kEmulateContinuousTessellationDefault = true;
+#else
+constexpr bool kEmulateContinuousTessellationDefault = false;
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_emulate_continuous_tessellation, kEmulateContinuousTessellationDefault,
+                    "GPU/Vulkan",
+                    "Draw continuous-tessellated quad patches with a constant even factor as "
+                    "instanced triangle grids in the vertex shader instead of using the host "
+                    "tessellation")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -65,7 +83,8 @@ bool VulkanPrimitiveProcessor::Initialize() {
   if (!InitializeCommon(
           device_properties.fullDrawIndexUint32, triangle_fans_supported_without_conversion, false,
           quad_lists_supported_without_conversion, point_sprites_supported_without_vs_expansion,
-          rectangle_lists_supported_without_vs_expansion)) {
+          rectangle_lists_supported_without_vs_expansion,
+          REXCVAR_GET(vulkan_emulate_continuous_tessellation))) {
     Shutdown();
     return false;
   }

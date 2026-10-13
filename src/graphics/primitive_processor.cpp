@@ -124,7 +124,8 @@ bool PrimitiveProcessor::InitializeCommon(bool full_32bit_vertex_indices_support
                                           bool triangle_fans_supported, bool line_loops_supported,
                                           bool quad_lists_supported,
                                           bool point_sprites_supported_without_vs_expansion,
-                                          bool rectangle_lists_supported_without_vs_expansion) {
+                                          bool rectangle_lists_supported_without_vs_expansion,
+                                          bool emulate_continuous_quad_patch_tessellation) {
   full_32bit_vertex_indices_used_ = full_32bit_vertex_indices_supported;
   convert_triangle_fans_to_lists_ =
       !triangle_fans_supported || REXCVAR_GET(force_convert_triangle_fans_to_lists);
@@ -137,6 +138,7 @@ bool PrimitiveProcessor::InitializeCommon(bool full_32bit_vertex_indices_support
   // HostVertexShaderTypes).
   expand_point_sprites_in_vs_ = !point_sprites_supported_without_vs_expansion;
   expand_rectangle_lists_in_vs_ = !rectangle_lists_supported_without_vs_expansion;
+  emulate_continuous_quad_patch_tessellation_ = emulate_continuous_quad_patch_tessellation;
 
   // Initialize the index buffer for conversion of auto-indexed primitive types.
   size_t builtin_index_buffer_size = 0;
@@ -182,6 +184,17 @@ bool PrimitiveProcessor::InitializeCommon(bool full_32bit_vertex_indices_support
     builtin_index_buffer_size += sizeof(uint16_t) * GetQuadListTriangleListIndexCount(UINT16_MAX);
   } else {
     builtin_ib_offset_quad_lists_to_triangle_lists_ = SIZE_MAX;
+  }
+  // Grids of (N + 1) x (N + 1) vertices for continuous quad patches drawn as
+  // instanced triangle lists, one for every even N from 2 to 64.
+  for (size_t& tess_grid_offset : builtin_ib_offset_tess_grid_) {
+    tess_grid_offset = SIZE_MAX;
+  }
+  if (emulate_continuous_quad_patch_tessellation_) {
+    for (uint32_t factor = 2; factor <= 64; factor += 2) {
+      builtin_ib_offset_tess_grid_[factor / 2] = builtin_index_buffer_size;
+      builtin_index_buffer_size += sizeof(uint16_t) * 6 * factor * factor;
+    }
   }
   if (builtin_index_buffer_size) {
     if (!InitializeBuiltinIndexBuffer(
@@ -233,6 +246,42 @@ bool PrimitiveProcessor::InitializeCommon(bool full_32bit_vertex_indices_support
                   *(triangle_list_ptr++) = quad_first_index;
                   *(triangle_list_ptr++) = quad_first_index + 2;
                   *(triangle_list_ptr++) = quad_first_index + 3;
+                }
+              }
+              if (emulate_continuous_quad_patch_tessellation_) {
+                for (uint32_t factor = 2; factor <= 64; factor += 2) {
+                  // Vertex (i, j) is j * (factor + 1) + i, u increasing with i
+                  // and v increasing with j. Clockwise with the domain origin
+                  // in the upper left corner, like the host tessellator output.
+                  uint16_t* triangle_list_ptr =
+                      mapping_16bit + builtin_ib_offset_tess_grid_[factor / 2] / sizeof(uint16_t);
+                  for (uint32_t j = 0; j < factor; ++j) {
+                    for (uint32_t i = 0; i < factor; ++i) {
+                      uint16_t v00 = uint16_t(j * (factor + 1) + i);
+                      uint16_t v10 = v00 + 1;
+                      uint16_t v01 = uint16_t(v00 + (factor + 1));
+                      uint16_t v11 = v01 + 1;
+                      // Diagonals point towards the patch center (mirrored
+                      // per quadrant), as in the Direct3D 11 / Metal
+                      // tessellator, so the triangles match the host
+                      // tessellation of neighboring and multipass patches.
+                      if ((i < factor / 2) == (j < factor / 2)) {
+                        *(triangle_list_ptr++) = v00;
+                        *(triangle_list_ptr++) = v10;
+                        *(triangle_list_ptr++) = v11;
+                        *(triangle_list_ptr++) = v00;
+                        *(triangle_list_ptr++) = v11;
+                        *(triangle_list_ptr++) = v01;
+                      } else {
+                        *(triangle_list_ptr++) = v00;
+                        *(triangle_list_ptr++) = v10;
+                        *(triangle_list_ptr++) = v01;
+                        *(triangle_list_ptr++) = v10;
+                        *(triangle_list_ptr++) = v11;
+                        *(triangle_list_ptr++) = v01;
+                      }
+                    }
+                  }
                 }
               }
             })) {
@@ -350,6 +399,20 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         // - 4D5307F1 - ground - continuous.
         // - 4D5307F2 - garden ground - adaptive.
         host_vertex_shader_type = Shader::HostVertexShaderType::kQuadDomainPatchIndexed;
+        if (emulate_continuous_quad_patch_tessellation_ &&
+            tessellation_mode == xenos::TessellationMode::kContinuous) {
+          // With a constant even integer factor, draw the patches as instanced
+          // grids of triangles with the domain location computed in the vertex
+          // shader instead of using the host tessellation.
+          float tessellation_factor = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+          if (tessellation_factor >= 2.0f && tessellation_factor <= 64.0f &&
+              tessellation_factor == float(uint32_t(tessellation_factor)) &&
+              !(uint32_t(tessellation_factor) & 1)) {
+            host_vertex_shader_type =
+                Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList;
+            host_primitive_type = xenos::PrimitiveType::kTriangleList;
+          }
+        }
         break;
       default:
         // TODO(Triang3l): Support line patches.
@@ -428,19 +491,36 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   cacheable.host_draw_vertex_count = guest_draw_vertex_count;
   cacheable.host_primitive_reset_enabled = false;
   cacheable.host_index_buffer_handle = SIZE_MAX;
+  uint32_t host_draw_instance_count = 1;
   if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
-      host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
-    // As two-triangle strips, with guest indices being either autogenerated or
-    // fetched via DMA.
-    uint32_t primitive_count = guest_draw_vertex_count;
-    if (host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
-      primitive_count /= 3;
+      host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip ||
+      host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList) {
+    // As two-triangle strips (or, for the emulated tessellation, instanced
+    // grids of triangles with one patch per instance), with guest indices being
+    // either autogenerated or fetched via DMA.
+    if (host_vertex_shader_type ==
+        Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList) {
+      uint32_t tessellation_factor =
+          uint32_t(regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f);
+      cacheable.host_draw_vertex_count =
+          guest_draw_vertex_count ? 6 * tessellation_factor * tessellation_factor : 0;
+      host_draw_instance_count = guest_draw_vertex_count;
+      cacheable.host_index_format = xenos::IndexFormat::kInt16;
+      cacheable.host_primitive_reset_enabled = false;
+      assert_true(builtin_ib_offset_tess_grid_[tessellation_factor / 2] != SIZE_MAX);
+      cacheable.host_index_buffer_handle = builtin_ib_offset_tess_grid_[tessellation_factor / 2];
+    } else {
+      uint32_t primitive_count = guest_draw_vertex_count;
+      if (host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+        primitive_count /= 3;
+      }
+      cacheable.host_draw_vertex_count = GetTwoTriangleStripIndexCount(primitive_count);
+      cacheable.host_index_format = xenos::IndexFormat::kInt32;
+      cacheable.host_primitive_reset_enabled = true;
+      assert_true(builtin_ib_offset_two_triangle_strips_ != SIZE_MAX);
+      cacheable.host_index_buffer_handle = builtin_ib_offset_two_triangle_strips_;
     }
-    cacheable.host_draw_vertex_count = GetTwoTriangleStripIndexCount(primitive_count);
-    cacheable.host_index_format = xenos::IndexFormat::kInt32;
-    cacheable.host_primitive_reset_enabled = true;
-    assert_true(builtin_ib_offset_two_triangle_strips_ != SIZE_MAX);
-    cacheable.host_index_buffer_handle = builtin_ib_offset_two_triangle_strips_;
     if (vgt_draw_initiator.source_select == xenos::SourceSelect::kAutoIndex) {
       cacheable.index_buffer_type = ProcessedIndexBufferType::kHostBuiltinForAuto;
       cacheable.host_shader_index_endian = xenos::Endian::kNone;
@@ -926,6 +1006,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   result_out.tessellation_mode = tessellation_mode;
   result_out.guest_draw_vertex_count = guest_draw_vertex_count;
   result_out.host_draw_vertex_count = cacheable.host_draw_vertex_count;
+  result_out.host_draw_instance_count = host_draw_instance_count;
   result_out.line_loop_closing_index = line_loop_closing_index;
   result_out.index_buffer_type = cacheable.index_buffer_type;
   result_out.guest_index_base = guest_index_base;

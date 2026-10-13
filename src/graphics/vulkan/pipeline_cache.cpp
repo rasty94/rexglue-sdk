@@ -927,6 +927,12 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
   } else {
     modification.vertex.tessellation_mode = 0;
   }
+  if (host_vertex_shader_type ==
+      Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList) {
+    // The primitive processor has already checked that it's an even integer.
+    modification.vertex.emulated_tessellation_factor =
+        uint32_t(regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f);
+  }
 
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes = pa_cl_clip_cntl.clip_disable ? 0 : pa_cl_clip_cntl.ucp_ena;
