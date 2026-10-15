@@ -34,6 +34,7 @@
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -41,7 +42,14 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DEFINE_BOOL(vulkan_host_msaa_1x, false, "GPU/Vulkan",
+// MoltenVK (Apple tile-based GPUs): multisampled host render targets cost
+// ~28 ms/frame in Fable 2's 3D scenes; default to 1-sample 2x targets there.
+#if REX_PLATFORM_MAC
+constexpr bool kHostMsaa1xDefault = true;
+#else
+constexpr bool kHostMsaa1xDefault = false;
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_host_msaa_1x, kHostMsaa1xDefault, "GPU/Vulkan",
                     "Host render targets path: draw guest 2x MSAA render targets into 1-sample "
                     "host images (keeps the guest EDRAM layout and resolves; no edge "
                     "anti-aliasing, alpha-to-mask degrades to a dither; 4x stays 4x). Faster on "
