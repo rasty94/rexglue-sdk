@@ -3279,6 +3279,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   VkSampleMask sample_mask = UINT32_MAX;
   VkPipelineMultisampleStateCreateInfo multisample_state = {};
   multisample_state.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  // Must match the host images (1-sample with vulkan_host_msaa_1x).
+  xenos::MsaaSamples host_msaa_samples =
+      render_target_cache_.GetHostMsaaSamples(description.render_pass_key.msaa_samples);
   if (description.rasterizer_discard) {
     // Keep rasterizer-discard pipelines independent from guest MSAA state, as
     // done by D3D12 when rasterization is disabled.
@@ -3287,7 +3290,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     // Keep parity with D3D12 host-render-target path, where draws without
     // color/depth attachments must run at 1x sample count.
     multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-  } else if (description.render_pass_key.msaa_samples == xenos::MsaaSamples::k2X &&
+  } else if (host_msaa_samples == xenos::MsaaSamples::k2X &&
              !render_target_cache_.IsMsaa2xSupported(subpass_has_attachments)) {
     // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
     // sample locations, but still top-left and bottom-right - however, this can
@@ -3300,7 +3303,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     }
   } else {
     multisample_state.rasterizationSamples =
-        VkSampleCountFlagBits(uint32_t(1) << uint32_t(description.render_pass_key.msaa_samples));
+        VkSampleCountFlagBits(uint32_t(1) << uint32_t(host_msaa_samples));
   }
   if (description.sample_rate_shading &&
       multisample_state.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {

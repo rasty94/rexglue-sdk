@@ -141,6 +141,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     return depth_float24_convert_in_pixel_shader_;
   }
 
+  // Sample count of the host image backing a guest render target. Guest
+  // keys, EDRAM addressing and system constants keep the guest count; with
+  // vulkan_host_msaa_1x, only the host images of guest 2x render targets (and
+  // the pipelines drawing to them) are 1-sample.
+  // ponytail: 4x stays 4x. Its 2 horizontal samples per pixel become distinct
+  // pixels or 64bpp halves when the guest aliases the EDRAM as 2x/1x or
+  // 32/64bpp, so a 1-sample image loses every other column (vertical stripes)
+  // or a 64bpp half (wrong colors). 2x only loses its vertical sample, which
+  // matters only for 1x <-> 2x aliasing (row doubling).
+  xenos::MsaaSamples GetHostMsaaSamples(xenos::MsaaSamples guest_msaa_samples) const {
+    return host_msaa_1x_ && guest_msaa_samples == xenos::MsaaSamples::k2X ? xenos::MsaaSamples::k1X
+                                                                           : guest_msaa_samples;
+  }
+
   bool msaa_2x_attachments_supported() const { return msaa_2x_attachments_supported_; }
   bool msaa_2x_no_attachments_supported() const { return msaa_2x_no_attachments_supported_; }
   bool IsMsaa2xSupported(bool subpass_has_attachments) const {
@@ -819,6 +833,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool msaa_2x_attachments_supported_ = false;
   bool msaa_2x_no_attachments_supported_ = false;
+  // Host render targets path only, fixed at initialization.
+  bool host_msaa_1x_ = false;
   bool color_16bit_transfer_uint_formats_supported_ = true;
   bool color_32bit_transfer_uint_formats_supported_ = true;
   bool color_rg16_draw_format_fallback_to_float_ = false;

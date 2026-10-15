@@ -41,6 +41,13 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(vulkan_host_msaa_1x, false, "GPU/Vulkan",
+                    "Host render targets path: draw guest 2x MSAA render targets into 1-sample "
+                    "host images (keeps the guest EDRAM layout and resolves; no edge "
+                    "anti-aliasing, alpha-to-mask degrades to a dither; 4x stays 4x). Faster on "
+                    "tile-based GPUs.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // DEFINE_string(
 //     render_target_path_vulkan, "",
 //     "Render target emulation path to use on Vulkan.\n"
@@ -644,6 +651,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // Host render targets.
 
     gamma_render_target_as_unorm16_ = gamma_render_target_as_unorm16_requested;
+
+    host_msaa_1x_ = REXCVAR_GET(vulkan_host_msaa_1x);
+    if (host_msaa_1x_) {
+      REXGPU_INFO("VulkanRenderTargetCache: guest 2x MSAA render targets use 1-sample host images");
+    }
 
     depth_float24_round_ = REXCVAR_GET(depth_float24_round);
     depth_float24_convert_in_pixel_shader_ = REXCVAR_GET(depth_float24_convert_in_pixel_shader);
@@ -1568,7 +1580,7 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
   }
 
   VkSampleCountFlagBits samples;
-  switch (key.msaa_samples) {
+  switch (GetHostMsaaSamples(key.msaa_samples)) {
     case xenos::MsaaSamples::k1X:
       samples = VK_SAMPLE_COUNT_1_BIT;
       break;
@@ -1760,8 +1772,9 @@ VkFormat VulkanRenderTargetCache::GetColorOwnershipTransferVulkanFormat(
   if (is_integer_out) {
     *is_integer_out = true;
   }
+  // The format of the host image, thus the host sample count.
   VkSampleCountFlagBits transfer_sample_count =
-      VkSampleCountFlagBits(uint32_t(1) << uint32_t(msaa_samples));
+      VkSampleCountFlagBits(uint32_t(1) << uint32_t(GetHostMsaaSamples(msaa_samples)));
   if (transfer_sample_count == VK_SAMPLE_COUNT_2_BIT && !msaa_2x_attachments_supported_) {
     // 2x guest color render targets are allocated as 4x host render targets in
     // this mode.
@@ -1874,10 +1887,12 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   image_create_info.extent.depth = 1;
   image_create_info.mipLevels = 1;
   image_create_info.arrayLayers = 1;
-  if (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+  // The extent is in guest pixels for the guest sample count either way.
+  xenos::MsaaSamples host_msaa_samples = GetHostMsaaSamples(key.msaa_samples);
+  if (host_msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
     image_create_info.samples = VK_SAMPLE_COUNT_4_BIT;
   } else {
-    image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
+    image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(host_msaa_samples));
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -2436,7 +2451,11 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   // Generating SPIR-V 1.0, no need to add bindings to the entry point's
   // interface until SPIR-V 1.4.
   // Color source.
-  bool source_is_multisampled = key.source_msaa_samples != xenos::MsaaSamples::k1X;
+  // The key has guest sample counts (they define the EDRAM layout); whether the
+  // host images are multisampled may differ with vulkan_host_msaa_1x.
+  bool source_is_multisampled =
+      GetHostMsaaSamples(key.source_msaa_samples) != xenos::MsaaSamples::k1X;
+  bool dest_is_multisampled = GetHostMsaaSamples(key.dest_msaa_samples) != xenos::MsaaSamples::k1X;
   spv::Id source_color_texture = spv::NoResult;
   if (pipeline_layout_info.used_descriptor_sets & kTransferUsedDescriptorSetColorTextureBit) {
     source_color_texture = builder.createVariable(
@@ -2513,9 +2532,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
       kTransferUsedDescriptorSetHostDepthStencilTexturesBit) {
     host_depth_source_texture = builder.createVariable(
         spv::NoPrecision, spv::StorageClassUniformConstant,
-        builder.makeImageType(type_float, spv::Dim2D, false, false,
-                              key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X, 1,
-                              spv::ImageFormatUnknown),
+        builder.makeImageType(
+            type_float, spv::Dim2D, false, false,
+            GetHostMsaaSamples(key.host_depth_source_msaa_samples) != xenos::MsaaSamples::k1X, 1,
+            spv::ImageFormatUnknown),
         "xe_transfer_host_depth");
     builder.addDecoration(
         host_depth_source_texture, spv::DecorationDescriptorSet,
@@ -2586,7 +2606,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   main_interface.push_back(input_fragment_coord);
   spv::Id input_sample_id = spv::NoResult;
   spv::Id spec_const_sample_id = spv::NoResult;
-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
+  if (dest_is_multisampled) {
     if (device_properties.sampleRateShading) {
       // One draw for all samples.
       builder.addCapability(spv::CapabilitySampleRateShading);
@@ -2669,7 +2689,12 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   // Load the destination sample index.
   spv::Id dest_sample_id = spv::NoResult;
   if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
-    if (device_properties.sampleRateShading) {
+    if (!dest_is_multisampled) {
+      // ponytail: 1-sample host image of a guest 2x destination - the pixel
+      // stores host sample 0 of the guest layout, the other vertical sample
+      // (a different source row when the source is 1x) is dropped.
+      dest_sample_id = builder.makeUintConstant(0);
+    } else if (device_properties.sampleRateShading) {
       assert_true(input_sample_id != spv::NoResult);
       dest_sample_id = builder.createUnaryOp(spv::OpBitcast, type_uint,
                                              builder.createLoad(input_sample_id, spv::NoPrecision));
@@ -3043,9 +3068,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
       builder.createCompositeConstruct(type_int2, id_vector_temp),
   };
   spv::Id source_sample_ids_int[2] = {};
-  if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
+  if (source_is_multisampled) {
     source_sample_ids_int[0] = builder.createUnaryOp(spv::OpBitcast, type_int, source_sample_id);
   } else {
+    // A 1-sample host image of a guest MSAA source holds one value per pixel.
     source_texture_parameters.lod = builder.makeIntConstant(0);
   }
   // Go to the next sample or pixel along X if need to load two dwords.
@@ -3053,8 +3079,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   if (source_load_is_two_32bpp_samples) {
     if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
       source_coordinates[1] = source_coordinates[0];
-      source_sample_ids_int[1] = builder.createBinOp(
-          spv::OpBitwiseOr, type_int, source_sample_ids_int[0], builder.makeIntConstant(1));
+      if (source_is_multisampled) {
+        source_sample_ids_int[1] = builder.createBinOp(
+            spv::OpBitwiseOr, type_int, source_sample_ids_int[0], builder.makeIntConstant(1));
+      }
     } else {
       id_vector_temp.clear();
       id_vector_temp.push_back(builder.createBinOp(spv::OpBitwiseOr, type_int, source_pixel_x_int,
@@ -4049,7 +4077,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             id_vector_temp.push_back(host_depth_source_pixel_y_int);
             host_depth_source_texture_parameters.coords =
                 builder.createCompositeConstruct(type_int2, id_vector_temp);
-            if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
+            if (GetHostMsaaSamples(key.host_depth_source_msaa_samples) !=
+                xenos::MsaaSamples::k1X) {
               host_depth_source_texture_parameters.sample =
                   builder.createUnaryOp(spv::OpBitcast, type_int, host_depth_source_sample_id);
             } else {
@@ -4070,7 +4099,30 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             assert_true(key.host_depth_source_msaa_samples == xenos::MsaaSamples::k1X);
             spv::Id dest_tile_sample_x = dest_tile_pixel_x;
             spv::Id dest_tile_sample_y = dest_tile_pixel_y;
-            if (key.dest_msaa_samples >= xenos::MsaaSamples::k2X) {
+            spv::Id host_depth_tile_index = dest_tile_index;
+            if (!dest_is_multisampled && key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
+              // The 1-sample host image of a guest MSAA destination was stored
+              // by the 1x host depth store shader, which tiles host pixels as
+              // if they were 1x samples (80x16 per tile), not in the guest
+              // MSAA layout.
+              spv::Id const_tile_width_samples = builder.makeUintConstant(tile_width_samples);
+              spv::Id const_tile_height_samples = builder.makeUintConstant(tile_height_samples);
+              host_depth_tile_index = builder.createBinOp(
+                  spv::OpIAdd, type_uint,
+                  builder.createBinOp(
+                      spv::OpIMul, type_uint,
+                      builder.createTriOp(spv::OpBitFieldUExtract, type_uint, address_constant,
+                                          builder.makeUintConstant(0),
+                                          builder.makeUintConstant(xenos::kEdramPitchTilesBits)),
+                      builder.createBinOp(spv::OpUDiv, type_uint, dest_pixel_y,
+                                          const_tile_height_samples)),
+                  builder.createBinOp(spv::OpUDiv, type_uint, dest_pixel_x,
+                                      const_tile_width_samples));
+              dest_tile_sample_x = builder.createBinOp(spv::OpUMod, type_uint, dest_pixel_x,
+                                                       const_tile_width_samples);
+              dest_tile_sample_y = builder.createBinOp(spv::OpUMod, type_uint, dest_pixel_y,
+                                                       const_tile_height_samples);
+            } else if (key.dest_msaa_samples >= xenos::MsaaSamples::k2X) {
               if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
                 // Horizontal sample index in bit 0.
                 dest_tile_sample_x = builder.createQuadOp(
@@ -4096,7 +4148,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 builder.createBinOp(
                     spv::OpIMul, type_uint,
                     builder.makeUintConstant(tile_width_samples * tile_height_samples),
-                    dest_tile_index),
+                    host_depth_tile_index),
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
@@ -4298,7 +4350,8 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
     return nullptr;
   }
 
-  uint32_t dest_sample_count = uint32_t(1) << uint32_t(key.shader_key.dest_msaa_samples);
+  uint32_t dest_sample_count = uint32_t(1)
+                               << uint32_t(GetHostMsaaSamples(key.shader_key.dest_msaa_samples));
   bool dest_is_masked_sample = dest_sample_count > 1 && !device_properties.sampleRateShading;
 
   VkPipelineShaderStageCreateInfo shader_stages[2];
@@ -4594,8 +4647,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       }
       if (!host_depth_store_set_up) {
         // Pipeline.
+        // With a 1-sample host image of a guest MSAA render target, the 1x
+        // shader stores host pixels tiled as 1x samples - the transfer shader
+        // reads them back the same way.
         command_processor_.BindExternalComputePipeline(
-            host_depth_store_pipelines_[size_t(dest_rt_key.msaa_samples)]);
+            host_depth_store_pipelines_[size_t(GetHostMsaaSamples(dest_rt_key.msaa_samples))]);
         // Descriptor set bindings.
         VkDescriptorSet host_depth_store_descriptor_sets[] = {
             edram_storage_buffer_descriptor_set_,
@@ -4641,7 +4697,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
         uint32_t group_count_x, group_count_y;
-        GetHostDepthStoreRectangleInfo(transfer_rectangles[j], dest_rt_key.msaa_samples,
+        GetHostDepthStoreRectangleInfo(transfer_rectangles[j],
+                                       GetHostMsaaSamples(dest_rt_key.msaa_samples),
                                        host_depth_store_rectangle_constant, group_count_x,
                                        group_count_y);
         command_buffer.CmdVkPushConstants(
@@ -5055,10 +5112,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             transfer_mode_info.pipeline_layout;
         const TransferPipelineLayoutInfo& transfer_pipeline_layout_info =
             kTransferPipelineLayoutInfos[size_t(transfer_pipeline_layout_index)];
-        uint32_t transfer_sample_pipeline_count = vulkan_device->properties().sampleRateShading
-                                                      ? 1
-                                                      : uint32_t(1)
-                                                            << uint32_t(dest_rt_key.msaa_samples);
+        uint32_t transfer_sample_pipeline_count =
+            vulkan_device->properties().sampleRateShading
+                ? 1
+                : uint32_t(1) << uint32_t(GetHostMsaaSamples(dest_rt_key.msaa_samples));
         bool transfer_is_stencil_bit = (transfer_pipeline_layout_info.used_push_constant_dwords &
                                         kTransferUsedPushConstantDwordStencilMaskBit) != 0;
 
@@ -5452,7 +5509,10 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   builder.addDecoration(edram_buffer, spv::DecorationDescriptorSet, kDumpDescriptorSetEdram);
   builder.addDecoration(edram_buffer, spv::DecorationBinding, 0);
   // Color or depth source.
-  bool source_is_multisampled = key.msaa_samples != xenos::MsaaSamples::k1X;
+  // With vulkan_host_msaa_1x, the guest MSAA layout is still addressed, but the
+  // host image has one sample per pixel, which is written to every guest
+  // sample of the pixel.
+  bool source_is_multisampled = GetHostMsaaSamples(key.msaa_samples) != xenos::MsaaSamples::k1X;
   bool source_is_uint;
   if (key.is_depth) {
     source_is_uint = false;
@@ -5625,7 +5685,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   // Get the source pixel coordinate and the sample index within the pixel.
   spv::Id source_pixel_x = source_sample_x, source_pixel_y = source_sample_y;
   spv::Id source_sample_id = spv::NoResult;
-  if (source_is_multisampled) {
+  if (key.msaa_samples != xenos::MsaaSamples::k1X) {
     spv::Id const_uint_1 = builder.makeUintConstant(1);
     source_pixel_y =
         builder.createBinOp(spv::OpShiftRightLogical, type_uint, source_sample_y, const_uint_1);
