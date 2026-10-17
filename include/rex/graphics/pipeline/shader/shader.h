@@ -666,6 +666,11 @@ class Shader {
     // drawn as an instanced triangle list grid (one instance per patch), for
     // implementations where hardware tessellation is slow (MoltenVK).
     kQuadDomainPatchIndexedAsTriangleList,
+
+    // Square point sprites drawn as host points (gl_PointSize and
+    // gl_PointCoord) instead of being expanded, for implementations without
+    // geometry shaders where the expansion is slow (MoltenVK).
+    kPointListAsNativePoints,
   };
   // For packing HostVertexShaderType in bit fields.
   static constexpr uint32_t kHostVertexShaderTypeBitCount = 4;

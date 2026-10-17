@@ -42,6 +42,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/types.h>
 #include <rex/memory/utils.h>
+#include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -87,6 +88,21 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// MoltenVK (Apple GPUs, no geometry shaders): expanding point sprites in the
+// vertex shader runs the guest vertex shader 4 times per point, ~9 ms/frame of
+// vertex work with Fable 2's snow.
+#if REX_PLATFORM_MAC
+constexpr bool kNativePointSpritesDefault = true;
+#else
+constexpr bool kNativePointSpritesDefault = false;
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_native_point_sprites, kNativePointSpritesDefault, "GPU/Vulkan",
+                    "Without geometry shaders, draw square point sprites as host points "
+                    "(gl_PointSize / gl_PointCoord) instead of expanding them to quads in the "
+                    "vertex shader. Points with the center outside the viewport may be culled "
+                    "as a whole rather than clipped.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
@@ -3711,6 +3727,43 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                              ps_param_gen_pos))
                    : 0;
 
+  // Draw square point sprites as host points where that gives the same result
+  // as the expansion in the vertex shader.
+  bool native_point_sprites = false;
+  if (REXCVAR_GET(vulkan_native_point_sprites) &&
+      primitive_processor_->IsExpandingPointSpritesInVS() &&
+      regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList &&
+      !memexport_used_vertex) {
+    auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
+    auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+    uint32_t draw_resolution_scale = texture_cache_->draw_resolution_scale_x();
+    // 12.4 fixed-point radii in guest pixels to diameters in host pixels.
+    float point_size_scale = float(draw_resolution_scale) * (2.0f / 16.0f);
+    float point_constant_size = float(pa_su_point_size.width) * point_size_scale;
+    float point_size_max =
+        device_properties.largePoints ? device_properties.pointSizeRange[1] : 1.0f;
+    float point_poly_offset_scale, point_poly_offset;
+    draw_util::GetPreferredFacePolygonOffset(regs, false, point_poly_offset_scale,
+                                             point_poly_offset);
+    native_point_sprites =
+        // Square in host pixels.
+        pa_su_point_size.width == pa_su_point_size.height &&
+        draw_resolution_scale == texture_cache_->draw_resolution_scale_y() &&
+        // The constant size (when the vertex shader doesn't write one) is zero
+        // (dropped, like an empty expanded quad) or within the host range.
+        (!point_constant_size || (point_constant_size >= device_properties.pointSizeRange[0] &&
+                                  point_constant_size <= point_size_max)) &&
+        // Per-vertex sizes, clamped to PA_SU_POINT_MINMAX, not above the range.
+        (!(vertex_shader->writes_point_size_edge_flag_kill_vertex() & 0b001) ||
+         float(regs.Get<reg::PA_SU_POINT_MINMAX>().max_size) * point_size_scale <=
+             point_size_max) &&
+        // The expansion clips the sprite corners against user clip planes.
+        (pa_cl_clip_cntl.clip_disable || !pa_cl_clip_cntl.ucp_ena ||
+         pa_cl_clip_cntl.ps_ucp_mode < 2) &&
+        // Host depth bias applies only to polygons.
+        !point_poly_offset_scale && !point_poly_offset;
+  }
+
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   SpirvShaderTranslator::Modification vertex_shader_modification;
   SpirvShaderTranslator::Modification pixel_shader_modification;
@@ -3730,7 +3783,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
 
     // Process primitives.
-    if (!primitive_processor_->Process(primitive_processing_result)) {
+    if (!primitive_processor_->Process(primitive_processing_result, native_point_sprites)) {
       return draw_fail("primitive_processing");
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -3752,6 +3805,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         primitive_processing_result.host_vertex_shader_type;
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
+        host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsNativePoints &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
         host_vertex_shader_type !=
             Shader::HostVertexShaderType::kQuadDomainPatchIndexedAsTriangleList &&
@@ -3767,7 +3821,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         ps_param_gen_pos != UINT32_MAX);
     pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
                                                    *pixel_shader, interpolator_mask,
-                                                   ps_param_gen_pos, normalized_depth_control)
+                                                   ps_param_gen_pos, normalized_depth_control,
+                                                   host_vertex_shader_type ==
+                                                       Shader::HostVertexShaderType::
+                                                           kPointListAsNativePoints)
                                              : SpirvShaderTranslator::Modification(0);
 
     // Translate the shaders now to obtain the sampler bindings.

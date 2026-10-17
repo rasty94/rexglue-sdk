@@ -957,6 +957,9 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
 
   if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
     modification.vertex.output_point_parameters = uint32_t(ps_param_gen_used);
+  } else if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsNativePoints) {
+    // gl_PointSize and gl_PointCoord are used instead.
+    modification.vertex.output_point_parameters = 0;
   } else {
     modification.vertex.output_point_parameters =
         uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b001) &&
@@ -971,7 +974,7 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
 
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+    reg::RB_DEPTHCONTROL normalized_depth_control, bool native_points) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -992,10 +995,13 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_interpolator = param_gen_pos;
     modification.pixel.param_gen_point =
         uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList);
+    modification.pixel.param_gen_point_native =
+        modification.pixel.param_gen_point & uint32_t(native_points);
   } else {
     modification.pixel.param_gen_enable = 0;
     modification.pixel.param_gen_interpolator = 0;
     modification.pixel.param_gen_point = 0;
+    modification.pixel.param_gen_point_native = 0;
   }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -1434,7 +1440,9 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     } else {
       switch (primitive_processing_result.host_primitive_type) {
         case xenos::PrimitiveType::kPointList:
-          geometry_shader = PipelineGeometryShader::kPointList;
+          if (host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsNativePoints) {
+            geometry_shader = PipelineGeometryShader::kPointList;
+          }
           primitive_topology = PipelinePrimitiveTopology::kPointList;
           break;
         case xenos::PrimitiveType::kLineList:

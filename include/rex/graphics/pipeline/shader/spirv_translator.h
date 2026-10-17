@@ -91,6 +91,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // With param_gen_point, take the point sprite coordinates from
+      // gl_PointCoord (HostVertexShaderType kPointListAsNativePoints) rather
+      // than from the vertex shader output. Last so stored pipelines from
+      // before it was added (where it's zero) stay valid.
+      uint32_t param_gen_point_native : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -940,11 +945,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kOutputPerVertexMemberPosition,
     kOutputPerVertexMemberClipDistance,
     kOutputPerVertexMemberCullDistance,
+    kOutputPerVertexMemberPointSize,
     kOutputPerVertexMemberCountMax,
   };
   uint32_t output_per_vertex_member_count_;
   uint32_t output_per_vertex_member_clip_distance_;
   uint32_t output_per_vertex_member_cull_distance_;
+  // Only for HostVertexShaderType kPointListAsNativePoints.
+  uint32_t output_per_vertex_member_point_size_;
   spv::Id type_output_per_vertex_;
   spv::Id output_per_vertex_;
 

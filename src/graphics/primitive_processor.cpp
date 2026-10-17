@@ -325,7 +325,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
   std::memset(cache_buckets_non_empty_l2_, 0, sizeof(cache_buckets_non_empty_l2_));
 }
 
-bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_point_sprites) {
   SCOPE_profile_cpu_f("gpu");
 
   const RegisterFile& regs = register_file_;
@@ -431,8 +431,13 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
     switch (guest_primitive_type) {
       case xenos::PrimitiveType::kPointList:
         if (expand_point_sprites_in_vs_) {
-          host_primitive_type = xenos::PrimitiveType::kTriangleStrip;
-          host_vertex_shader_type = Shader::HostVertexShaderType::kPointListAsTriangleStrip;
+          if (native_point_sprites) {
+            // Guest indices drawn as they are, like a kVertex point list.
+            host_vertex_shader_type = Shader::HostVertexShaderType::kPointListAsNativePoints;
+          } else {
+            host_primitive_type = xenos::PrimitiveType::kTriangleStrip;
+            host_vertex_shader_type = Shader::HostVertexShaderType::kPointListAsTriangleStrip;
+          }
         }
         break;
       case xenos::PrimitiveType::kLineList:

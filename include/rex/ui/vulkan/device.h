@@ -72,6 +72,7 @@ class VulkanDevice {
     uint32_t maxFragmentCombinedOutputResources = 4;
     float maxSamplerAnisotropy = 1.0f;
     uint32_t maxViewportDimensions[2] = {4096, 4096};
+    float pointSizeRange[2] = {1.0f, 1.0f};
     VkDeviceSize minUniformBufferOffsetAlignment = 256;
     VkDeviceSize minStorageBufferOffsetAlignment = 256;
     uint32_t maxFramebufferWidth = 4096;
@@ -102,6 +103,7 @@ class VulkanDevice {
     bool sampleRateShading = false;
     bool depthClamp = false;
     bool fillModeNonSolid = false;
+    bool largePoints = false;
     bool samplerAnisotropy = false;
     bool occlusionQueryPrecise = false;
     bool vertexPipelineStoresAndAtomics = false;

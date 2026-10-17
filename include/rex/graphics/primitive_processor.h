@@ -169,8 +169,10 @@ class PrimitiveProcessor {
   bool IsExpandingRectangleListsInVS() const { return expand_rectangle_lists_in_vs_; }
 
   // Submission must be open to call (may request the index buffer in the shared
-  // memory).
-  bool Process(ProcessingResult& result_out);
+  // memory). native_point_sprites: draw a point list that would be expanded in
+  // the vertex shader as host points (kPointListAsNativePoints) instead - the
+  // caller checks that the sprites can be drawn exactly this way.
+  bool Process(ProcessingResult& result_out, bool native_point_sprites = false);
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,

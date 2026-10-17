@@ -128,6 +128,7 @@ void SpirvShaderTranslator::Reset() {
   output_per_vertex_member_count_ = 0;
   output_per_vertex_member_clip_distance_ = UINT32_MAX;
   output_per_vertex_member_cull_distance_ = UINT32_MAX;
+  output_per_vertex_member_point_size_ = UINT32_MAX;
   type_output_per_vertex_ = spv::NoResult;
   output_per_vertex_ = spv::NoResult;
   output_fragment_depth_ = spv::NoResult;
@@ -1755,6 +1756,12 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     struct_per_vertex_members.push_back(type_cull_distance);
     output_per_vertex_member_count_ = uint32_t(struct_per_vertex_members.size());
   }
+  if (shader_modification.vertex.host_vertex_shader_type ==
+      Shader::HostVertexShaderType::kPointListAsNativePoints) {
+    output_per_vertex_member_point_size_ = uint32_t(struct_per_vertex_members.size());
+    struct_per_vertex_members.push_back(type_float_);
+    output_per_vertex_member_count_ = uint32_t(struct_per_vertex_members.size());
+  }
   spv::Id type_struct_per_vertex =
       builder_->makeStructType(struct_per_vertex_members, "gl_PerVertex");
   builder_->addMemberName(type_struct_per_vertex, kOutputPerVertexMemberPosition, "gl_Position");
@@ -1771,6 +1778,12 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
                             "gl_CullDistance");
     builder_->addMemberDecoration(type_struct_per_vertex, output_per_vertex_member_cull_distance_,
                                   spv::DecorationBuiltIn, spv::BuiltInCullDistance);
+  }
+  if (output_per_vertex_member_point_size_ != UINT32_MAX) {
+    builder_->addMemberName(type_struct_per_vertex, output_per_vertex_member_point_size_,
+                            "gl_PointSize");
+    builder_->addMemberDecoration(type_struct_per_vertex, output_per_vertex_member_point_size_,
+                                  spv::DecorationBuiltIn, spv::BuiltInPointSize);
   }
   builder_->addDecoration(type_struct_per_vertex, spv::DecorationBlock);
   type_output_per_vertex_ = type_struct_per_vertex;
@@ -2668,6 +2681,59 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
         position_w);
   }
 
+  // Native point sprite: the full size in host framebuffer pixels - the same
+  // as the guest diameter times the resolution scale that the expansion below
+  // converts to the NDC radius (point_screen_diameter_to_ndc_radius is the
+  // resolution scale divided by the host viewport size). The host only uses
+  // this path for square sprites and uniform resolution scaling, so the X
+  // component of the constant diameter is the size.
+  if (output_per_vertex_member_point_size_ != UINT32_MAX) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantPointConstantDiameter));
+    id_vector_temp_.push_back(const_int_0_);
+    spv::Id point_diameter = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b001) {
+      assert_true(var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      spv::Id point_vertex_diameter = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_point_size_edge_flag_kill_vertex_, id_vector_temp_),
+          spv::NoPrecision);
+      // Non-negative if written by the guest shader (already clamped), -1.0
+      // from the header otherwise, like in the expansion.
+      point_diameter = builder_->createTriOp(
+          spv::OpSelect, type_float_,
+          builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, point_vertex_diameter,
+                                const_float_0_),
+          point_vertex_diameter, point_diameter);
+    }
+    if (draw_resolution_scale_x_ > 1) {
+      point_diameter = builder_->createNoContractionBinOp(
+          spv::OpFMul, type_float_, point_diameter,
+          builder_->makeFloatConstant(float(draw_resolution_scale_x_)));
+    }
+    // A zero-size expanded sprite covers no pixels, but gl_PointSize must be
+    // positive - drop the point with a NaN W (like vertex kill).
+    position_w = builder_->createTriOp(
+        spv::OpSelect, type_float_,
+        builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, point_diameter, const_float_0_),
+        position_w,
+        builder_->createUnaryOp(spv::OpBitcast, type_float_,
+                                builder_->makeUintConstant(UINT32_C(0x7FC00000))));
+    // ponytail: sub-pixel sprites are drawn as 1 pixel (the minimum size every
+    // Vulkan device supports); the host keeps the upper bound within the range.
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(int(output_per_vertex_member_point_size_)));
+    builder_->createStore(
+        builder_->createBinBuiltinCall(type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax,
+                                       point_diameter, builder_->makeFloatConstant(1.0f)),
+        builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_));
+  }
+
   // Write the point size.
   if (output_point_size_ != spv::NoResult) {
     spv::Id point_size;
@@ -2931,10 +2997,18 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     // Point coordinate input.
     if (shader_modification.pixel.param_gen_point) {
       if (param_gen_needed) {
-        input_point_coordinates_ = builder_->createVariable(
-            spv::NoPrecision, spv::StorageClassInput, type_float2_, "xe_in_point_coordinates");
-        builder_->addDecoration(input_point_coordinates_, spv::DecorationLocation,
-                                int(input_location));
+        if (shader_modification.pixel.param_gen_point_native) {
+          // Same convention as the expansion: (0, 0) at the top-left corner.
+          input_point_coordinates_ = builder_->createVariable(
+              spv::NoPrecision, spv::StorageClassInput, type_float2_, "gl_PointCoord");
+          builder_->addDecoration(input_point_coordinates_, spv::DecorationBuiltIn,
+                                  spv::BuiltInPointCoord);
+        } else {
+          input_point_coordinates_ = builder_->createVariable(
+              spv::NoPrecision, spv::StorageClassInput, type_float2_, "xe_in_point_coordinates");
+          builder_->addDecoration(input_point_coordinates_, spv::DecorationLocation,
+                                  int(input_location));
+        }
         main_interface_.push_back(input_point_coordinates_);
       }
       ++input_location;
